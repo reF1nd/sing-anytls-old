@@ -22,7 +22,8 @@ type Client struct {
 
 	dialOut util.DialOutFunc
 
-	sessionCounter atomic.Uint64
+	sessionCounter  atomic.Uint64
+	resetGeneration atomic.Uint64
 
 	idleSession     *skiplist.SkipList[uint64, *Session]
 	idleSessionLock sync.Mutex
@@ -115,15 +116,27 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				// Now client has been closed
 				session.Close()
 			default:
-				c.idleSessionLock.Lock()
-				session.idleSince = time.Now()
-				c.idleSession.Insert(math.MaxUint64-session.seq, session)
-				c.idleSessionLock.Unlock()
+				c.putIdleSession(session)
 			}
 		}
 	}
 
 	return stream, nil
+}
+
+func (c *Client) putIdleSession(session *Session) {
+	c.idleSessionLock.Lock()
+	if session.generation == c.resetGeneration.Load() && !session.IsClosed() {
+		session.idleSince = time.Now()
+		c.idleSession.Insert(math.MaxUint64-session.seq, session)
+		c.idleSessionLock.Unlock()
+		return
+	}
+	shouldClose := !session.IsClosed()
+	c.idleSessionLock.Unlock()
+	if shouldClose {
+		session.Close()
+	}
 }
 
 func (c *Client) getIdleSession() (idle *Session) {
@@ -138,6 +151,7 @@ func (c *Client) getIdleSession() (idle *Session) {
 }
 
 func (c *Client) createSession(ctx context.Context) (*Session, error) {
+	generation := c.resetGeneration.Load()
 	underlying, err := c.dialOut(ctx)
 	if err != nil {
 		return nil, err
@@ -145,6 +159,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 
 	session := NewClientSession(underlying, c.padding, c.logger)
 	session.seq = c.sessionCounter.Add(1)
+	session.generation = generation
 	session.dieHook = func() {
 		if !c.disableReuse {
 			c.idleSessionLock.Lock()
@@ -157,9 +172,25 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		c.sessionsLock.Unlock()
 	}
 
+	var clientClosed bool
 	c.sessionsLock.Lock()
-	c.sessions[session.seq] = session
+	select {
+	case <-c.die.Done():
+		clientClosed = true
+	default:
+	}
+	reset := generation != c.resetGeneration.Load()
+	if !clientClosed && !reset {
+		c.sessions[session.seq] = session
+	}
 	c.sessionsLock.Unlock()
+	if clientClosed || reset {
+		session.Close()
+		if clientClosed {
+			return nil, io.ErrClosedPipe
+		}
+		return nil, net.ErrClosed
+	}
 
 	session.Run()
 	return session, nil
@@ -167,20 +198,27 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 
 func (c *Client) Close() error {
 	c.dieCancel()
+	c.Reset()
+	return nil
+}
 
+// Reset closes all existing sessions without closing the client.
+func (c *Client) Reset() {
+	c.idleSessionLock.Lock()
 	c.sessionsLock.Lock()
+	c.resetGeneration.Add(1)
 	sessionToClose := make([]*Session, 0, len(c.sessions))
 	for _, session := range c.sessions {
 		sessionToClose = append(sessionToClose, session)
 	}
 	c.sessions = make(map[uint64]*Session)
+	c.idleSession.Clear()
 	c.sessionsLock.Unlock()
+	c.idleSessionLock.Unlock()
 
 	for _, session := range sessionToClose {
 		session.Close()
 	}
-
-	return nil
 }
 
 func (c *Client) idleCleanup() {

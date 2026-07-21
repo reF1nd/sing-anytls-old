@@ -89,3 +89,8 @@ func (c *Client) createOutboundConnection(ctx context.Context) (net.Conn, error)
 func (h *Client) Close() error {
 	return h.sessionClient.Close()
 }
+
+// Reset closes all existing sessions without closing the client.
+func (h *Client) Reset() {
+	h.sessionClient.Reset()
+}
