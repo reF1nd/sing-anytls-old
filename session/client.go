@@ -36,6 +36,7 @@ type Client struct {
 	idleSessionTimeout time.Duration
 	minIdleSession     int
 	disableReuse       bool
+	clientMetadata     string
 
 	logger logger.Logger
 }
@@ -44,6 +45,13 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout time.Duration, minIdleSession int,
 	disableReuse bool,
 ) *Client {
+	return NewClientWithClientMetadata(ctx, logger, dialOut, _padding, idleSessionCheckInterval, idleSessionTimeout, minIdleSession, disableReuse, util.Version)
+}
+
+func NewClientWithClientMetadata(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout time.Duration, minIdleSession int,
+	disableReuse bool, clientMetadata string,
+) *Client {
 	c := &Client{
 		sessions:           make(map[uint64]*Session),
 		dialOut:            dialOut,
@@ -51,6 +59,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		idleSessionTimeout: idleSessionTimeout,
 		minIdleSession:     minIdleSession,
 		disableReuse:       disableReuse,
+		clientMetadata:     clientMetadata,
 		logger:             logger,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
@@ -157,7 +166,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 
-	session := NewClientSession(underlying, c.padding, c.logger)
+	session := NewClientSessionWithClientMetadata(underlying, c.padding, c.logger, c.clientMetadata)
 	session.seq = c.sessionCounter.Add(1)
 	session.generation = generation
 	session.dieHook = func() {

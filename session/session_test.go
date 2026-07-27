@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/anytls/sing-anytls/padding"
+	"github.com/anytls/sing-anytls/util"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -77,6 +78,78 @@ func TestStreamWriteOver64KiB(t *testing.T) {
 	}
 	if !bytes.Equal(got.Bytes(), payload) {
 		t.Fatalf("server received %d bytes, want %d (and identical content)", got.Len(), N)
+	}
+}
+
+func TestClientSettingsClientMetadata(t *testing.T) {
+	testCases := []struct {
+		name           string
+		clientMetadata string
+	}{
+		{name: "empty"},
+		{name: "custom", clientMetadata: "custom-client/1.0"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer serverConn.Close()
+
+			var pad atomic.TypedValue[*padding.PaddingFactory]
+			padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &pad)
+			session := NewClientSessionWithClientMetadata(clientConn, &pad, logger.NOP(), testCase.clientMetadata)
+			defer session.Close()
+			session.Run()
+
+			if len(session.buffer) < headerOverHeadSize {
+				t.Fatalf("settings frame length = %d, want at least %d", len(session.buffer), headerOverHeadSize)
+			}
+			var header rawHeader
+			copy(header[:], session.buffer[:headerOverHeadSize])
+			if header.Cmd() != cmdSettings {
+				t.Fatalf("settings frame command = %d, want %d", header.Cmd(), cmdSettings)
+			}
+			dataLength := int(header.Length())
+			if len(session.buffer) != headerOverHeadSize+dataLength {
+				t.Fatalf("settings frame length = %d, want %d", len(session.buffer), headerOverHeadSize+dataLength)
+			}
+			settings := util.StringMapFromBytes(session.buffer[headerOverHeadSize:])
+			if settings["client"] != testCase.clientMetadata {
+				t.Fatalf("client setting = %q, want %q", settings["client"], testCase.clientMetadata)
+			}
+		})
+	}
+}
+
+func TestServerAcceptsEmptyClientMetadata(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	var pad atomic.TypedValue[*padding.PaddingFactory]
+	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &pad)
+	accepted := make(chan struct{})
+	serverSession := NewServerSession(serverConn, func(stream *Stream) {
+		close(accepted)
+		stream.Close()
+	}, &pad, logger.NOP())
+	go serverSession.Run()
+	defer serverSession.Close()
+
+	client := NewClientWithClientMetadata(context.Background(), logger.NOP(), func(context.Context) (net.Conn, error) {
+		return clientConn, nil
+	}, &pad, 0, 0, 0, false, "")
+	defer client.Close()
+	stream, err := client.CreateStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stream.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("server did not accept connection with empty client metadata")
 	}
 }
 

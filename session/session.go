@@ -43,23 +43,29 @@ type Session struct {
 	peerVersion byte
 
 	// client
-	isClient    bool
-	sendPadding bool
-	buffering   bool
-	buffer      []byte
-	pktCounter  atomic.Uint32
+	isClient       bool
+	sendPadding    bool
+	buffering      bool
+	buffer         []byte
+	pktCounter     atomic.Uint32
+	clientMetadata string
 
 	// server
 	onNewStream func(stream *Stream)
 }
 
 func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger) *Session {
+	return NewClientSessionWithClientMetadata(conn, _padding, logger, util.Version)
+}
+
+func NewClientSessionWithClientMetadata(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger, clientMetadata string) *Session {
 	s := &Session{
-		conn:        conn,
-		isClient:    true,
-		sendPadding: true,
-		padding:     _padding,
-		logger:      logger,
+		conn:           conn,
+		isClient:       true,
+		sendPadding:    true,
+		padding:        _padding,
+		logger:         logger,
+		clientMetadata: clientMetadata,
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -86,7 +92,7 @@ func (s *Session) Run() {
 
 	settings := util.StringMap{
 		"v":           "2",
-		"client":      util.Version,
+		"client":      s.clientMetadata,
 		"padding-md5": s.padding.Load().Md5,
 	}
 	f := newFrame(cmdSettings, 0)
