@@ -75,18 +75,17 @@ func (s *Service) UpdateUsers(users []User) {
 // NewConnection `conn` should be plaintext
 func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
 	b := buf.NewPacket()
-	defer b.Release()
 
 	n, err := b.ReadOnceFrom(conn)
 	if err != nil {
+		b.Release()
 		return err
 	}
-	conn = bufio.NewCachedConn(conn, b)
 
 	by, err := b.ReadBytes(32)
 	if err != nil {
 		b.Resize(0, n)
-		return s.fallback(ctx, conn, source, err, onClose)
+		return s.fallback(ctx, conn, b, source, err, onClose)
 	}
 	var passwordSha256 [32]byte
 	copy(passwordSha256[:], by)
@@ -94,23 +93,25 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		ctx = auth.ContextWithUser(ctx, user)
 	} else {
 		b.Resize(0, n)
-		return s.fallback(ctx, conn, source, E.New("unknown user password"), onClose)
+		return s.fallback(ctx, conn, b, source, E.New("unknown user password"), onClose)
 	}
 	by, err = b.ReadBytes(2)
 	if err != nil {
 		b.Resize(0, n)
-		return s.fallback(ctx, conn, source, E.Extend(err, "read padding length"), onClose)
+		return s.fallback(ctx, conn, b, source, E.Extend(err, "read padding length"), onClose)
 	}
 	paddingLen := binary.BigEndian.Uint16(by)
 	if paddingLen > 0 {
 		_, err = b.ReadBytes(int(paddingLen))
 		if err != nil {
 			b.Resize(0, n)
-			return s.fallback(ctx, conn, source, E.Extend(err, "read padding"), onClose)
+			return s.fallback(ctx, conn, b, source, E.Extend(err, "read padding"), onClose)
 		}
 	}
 
-	session := session.NewServerSession(conn, func(stream *session.Stream) {
+	// The cached connection owns the first packet until it is consumed or closed.
+	// Do not release it again after asynchronous handlers take ownership.
+	session := session.NewServerSession(bufio.NewCachedConn(conn, b), func(stream *session.Stream) {
 		destination, err := M.SocksaddrSerializer.ReadAddrPort(stream)
 		if err != nil {
 			s.logger.ErrorContext(ctx, "ReadAddrPort:", err)
@@ -124,10 +125,11 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 	return nil
 }
 
-func (s *Service) fallback(ctx context.Context, conn net.Conn, source M.Socksaddr, err error, onClose N.CloseHandlerFunc) error {
+func (s *Service) fallback(ctx context.Context, conn net.Conn, buffer *buf.Buffer, source M.Socksaddr, err error, onClose N.CloseHandlerFunc) error {
 	if s.fallbackHandler == nil {
+		buffer.Release()
 		return E.Extend(err, "fallback disabled")
 	}
-	s.fallbackHandler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, onClose)
+	s.fallbackHandler.NewConnectionEx(ctx, bufio.NewCachedConn(conn, buffer), source, M.Socksaddr{}, onClose)
 	return nil
 }
